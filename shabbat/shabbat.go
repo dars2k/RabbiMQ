@@ -17,6 +17,16 @@ func (c *RealClock) Now() time.Time {
 	return time.Now()
 }
 
+// FixedClock returns a fixed time, useful for tests.
+type FixedClock struct {
+	Time time.Time
+}
+
+// Now returns the fixed time.
+func (c *FixedClock) Now() time.Time {
+	return c.Time
+}
+
 // ShabbatClock determines if it is currently Shabbat.
 type ShabbatClock struct {
 	clock Clock

@@ -38,7 +38,10 @@ func New() RabbiMQ {
 
 // NewWithConfig creates a new RabbiMQ instance with an in-memory queue and config.
 func NewWithConfig(cfg Config) RabbiMQ {
-	clock := &shabbat.RealClock{}
+	return newWithClock(&shabbat.RealClock{}, cfg)
+}
+
+func newWithClock(clock shabbat.Clock, cfg Config) RabbiMQ {
 	shabbatClock := shabbat.NewShabbatClock(clock)
 	q := queue.NewInMemoryQueue()
 	b := broker.NewBrokerWithFactoryConfig(shabbatClock, q, func(channel string) (queue.Queue, error) {
@@ -54,8 +57,7 @@ func NewWithFile(filePath string) (RabbiMQ, error) {
 
 // NewWithFileConfig creates a new RabbiMQ instance with a persistent queue and config.
 func NewWithFileConfig(filePath string, cfg Config) (RabbiMQ, error) {
-	clock := &shabbat.RealClock{}
-	shabbatClock := shabbat.NewShabbatClock(clock)
+	shabbatClock := shabbat.NewShabbatClock(&shabbat.RealClock{})
 	q, err := queue.NewPersistentQueue(filePath)
 	if err != nil {
 		return nil, err

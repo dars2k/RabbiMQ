@@ -1,12 +1,14 @@
 package api
 
 import (
+	"RabbiMQ/shabbat"
 	"testing"
 	"time"
 )
 
 func TestPublishConsumeDefaultChannel(t *testing.T) {
-	mq := New()
+	clock := &shabbat.FixedClock{Time: time.Date(2024, time.January, 1, 12, 0, 0, 0, time.UTC)}
+	mq := newWithClock(clock, Config{})
 	consumer, err := mq.Consume("")
 	if err != nil {
 		t.Fatalf("consume failed: %v", err)
@@ -27,7 +29,8 @@ func TestPublishConsumeDefaultChannel(t *testing.T) {
 }
 
 func TestPublishConsumeChannel(t *testing.T) {
-	mq := New()
+	clock := &shabbat.FixedClock{Time: time.Date(2024, time.January, 1, 12, 0, 0, 0, time.UTC)}
+	mq := newWithClock(clock, Config{})
 	consumer, err := mq.Consume("orders")
 	if err != nil {
 		t.Fatalf("consume from channel failed: %v", err)
