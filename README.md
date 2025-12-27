@@ -1,8 +1,30 @@
-# RabbiMQ – A Kosher Message Broker
+# RabbiMQ
 
-RabbiMQ is a simple, reliable, and "kosher" message broker written in Go. It is designed to observe Shabbat, meaning it will not accept new tasks or deliver queued tasks during the Sabbath.
+RabbiMQ is a Shabbat-aware message broker written in Go. It queues work normally during the week and pauses all publishing and delivery during Shabbat, then resumes automatically.
 
-## Core Concept
+## Table of Contents
+
+- [Features](#features)
+- [How Shabbat Mode Works](#how-shabbat-mode-works)
+- [Installation](#installation)
+- [Usage](#usage)
+- [Network API](#network-api)
+- [Go SDK](#go-sdk)
+- [Examples](#examples)
+- [Technologies Used](#technologies-used)
+- [Contributing](#contributing)
+- [License](#license)
+- [Support](#support)
+
+## Features
+
+- Shabbat-aware queuing (no publish or delivery during Shabbat)
+- HTTP API with Server-Sent Events for streaming consumption
+- Per-channel queues and metrics
+- Optional TLS support
+- Docker and Docker Compose ready
+
+## How Shabbat Mode Works
 
 RabbiMQ enforces Halachic time rules:
 - **During Shabbat (Sabbath)**, the broker:
@@ -16,8 +38,6 @@ RabbiMQ enforces Halachic time rules:
 
 > “Six days you shall process messages, but on the seventh, you shall block.”
 
-## Shabbat Logic
-
 Shabbat is determined by the server’s local date and time. No external APIs are used.
 
 - **Shabbat starts:** Friday at 5:00 PM (17:00)
@@ -25,38 +45,155 @@ Shabbat is determined by the server’s local date and time. No external APIs ar
 
 This logic is centralized in the `shabbat.ShabbatClock` component. The time is injectable, which allows for deterministic testing.
 
-## How to Run
+## Installation
 
-To run the RabbiMQ broker, you can execute the `main` application:
+Prerequisites:
+- Go 1.25.5+ (see `go.mod`)
+- Docker (optional, for containerized runs)
+
+Install the CLI locally:
+
+```bash
+go install ./cmd/rabbimq
+```
+
+## Usage
+
+Run the broker (HTTP on `127.0.0.1:8080`):
 
 ```bash
 go run ./cmd/rabbimq/main.go
 ```
 
-This will start a simple demonstration where the broker attempts to publish messages. If it is currently Shabbat, the broker will refuse to publish. Otherwise, the messages will be published and consumed.
+Run with TLS:
 
-## Design Decisions
+```bash
+go run ./cmd/rabbimq/main.go -addr 127.0.0.1:8443 -tls-cert ./server.crt -tls-key ./server.key
+```
 
-- **Simplicity:** The broker is implemented as a single binary with a minimal feature set.
-- **In-Process Go API:** The primary API is an in-process Go API, which is simple and easy to use.
-- **In-Memory Queue:** Tasks are persisted in memory. This can be extended to disk-based persistence in the future.
-- **Thread Safety:** The broker is thread-safe and supports multiple producers and consumers.
-- **No Busy Waiting:** During Shabbat, the broker uses channels and timers to avoid busy waiting.
-- **Separation of Concerns:** The project is divided into clear packages:
-  - `broker`: The core message broker logic.
-  - `queue`: A thread-safe, in-memory FIFO queue.
-  - `shabbat`: The Shabbat time-tracking logic.
-  - `api`: The public-facing API for the broker.
-  - `cmd/rabbimq`: The main application entry point.
+Publish and consume via CLI:
 
-## TODOs for Future Extensions
+```bash
+go run ./cmd/rabbimq/main.go publish "my new task"
+go run ./cmd/rabbimq/main.go consume
+```
 
-- **Disk Persistence:** Implement a disk-based queue for durability.
-- **Clustering:** Add support for clustering to enable high availability.
-- **CLI Tool:** Create a command-line tool for interacting with the broker, e.g., `rabbimq publish`, `rabbimq consume`.
-- **Metrics:** Expose metrics such as the number of tasks held during Shabbat.
-- **Network API:** Add a network-based API (e.g., HTTP JSON or TCP) to allow for remote clients.
-- **Docker:** Add Docker support and `docker-compose` for the project.
-- **Example:** Add a simple project example folder.
-- **Docker** Add docker support and docker-compose for the project.
-- **Example** Add a simple project example folder
+Channel-specific usage:
+
+```bash
+go run ./cmd/rabbimq/main.go publish -channel orders "new order"
+go run ./cmd/rabbimq/main.go consume -channel orders
+```
+
+The `consume` command streams events by default. Use `-once` to exit after the first message.
+
+When connecting to a server with a self-signed certificate:
+
+```bash
+go run ./cmd/rabbimq/main.go publish -addr https://127.0.0.1:8443 -insecure "my new task"
+```
+
+Run with a shared server/client config file:
+
+```bash
+go run ./cmd/rabbimq/main.go -config ./examples/simple/rabbimq.yaml
+```
+
+Docker build and run:
+
+```bash
+docker build -t rabbimq .
+docker run --rm -p 8080:8080 rabbimq
+```
+
+Docker Compose:
+
+```bash
+docker compose up --build
+```
+
+## Network API
+
+RabbiMQ provides a simple HTTP-based API for remote clients.
+
+### Publish a Task
+
+- **Endpoint:** `/publish`
+- **Method:** `POST`
+- **Body:** The raw task data
+- **Optional query:** `?channel=<name>`
+
+```bash
+curl -X POST --data "my new task" http://127.0.0.1:8080/publish
+```
+
+### Consume Tasks (SSE)
+
+- **Endpoint:** `/consume`
+- **Method:** `GET`
+- **Optional query:** `?channel=<name>`
+
+This endpoint streams tasks using Server-Sent Events.
+
+```bash
+curl -N http://127.0.0.1:8080/consume
+```
+
+### Metrics
+
+- **Endpoint:** `/metrics`
+- **Method:** `GET`
+
+Returns JSON metrics, including tasks published, delivered, rejected, and the number held during Shabbat.
+
+### Channels
+
+- **Endpoint:** `/channels`
+- **Method:** `GET`
+
+Returns a JSON array of channels with their pending queue depth.
+
+```bash
+curl http://127.0.0.1:8080/channels
+```
+
+## Go SDK
+
+The SDK lets you publish and consume tasks without manually building HTTP requests. It uses a simple JSON config file.
+
+```json
+{
+  "address": "http://127.0.0.1:8080",
+  "timeout": "10s",
+  "insecure_skip_verify": false,
+  "ca_cert_file": "",
+  "channel": "orders"
+}
+```
+
+See `examples/simple/README.md` for end-to-end SDK usage.
+
+## Examples
+
+- Simple SDK example: `examples/simple/README.md`
+- Docker setup: `examples/docker/docker-compose.yml`
+
+## Technologies Used
+
+- Go (HTTP server + CLI)
+- Server-Sent Events (streaming consumption)
+- Docker (optional packaging)
+
+## Contributing
+
+Contributions are welcome. Please open an issue to discuss changes, then submit a pull request with:
+- a clear description of the change
+- tests or repro steps when applicable
+
+## License
+
+License information has not been added yet.
+
+## Support
+
+For help or bug reports, open an issue in this repository.
