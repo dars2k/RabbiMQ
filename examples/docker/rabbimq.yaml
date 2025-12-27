@@ -1,0 +1,8 @@
+passphrase: secret
+address: http://broker:8080
+limits:
+  maxQueueDepth: 1000
+  maxChannelDepth: 200
+  maxChannels: 20
+  maxConsumers: 50
+  maxMessageBytes: 1048576
