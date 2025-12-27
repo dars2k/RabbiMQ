@@ -1,0 +1,37 @@
+services:
+  broker:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./rabbimq.yaml:/config/rabbimq.yaml:ro
+    command: ["rabbimq", "-addr", "0.0.0.0:8080", "-config", "/config/rabbimq.yaml"]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/channels"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  producer:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    depends_on:
+      broker:
+        condition: service_healthy
+    volumes:
+      - ./rabbimq.yaml:/config/rabbimq.yaml:ro
+    command: ["rabbimq", "publish", "-addr", "http://broker:8080", "-channel", "orders", "-config", "/config/rabbimq.yaml", "new order"]
+
+  consumer:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    depends_on:
+      broker:
+        condition: service_healthy
+    volumes:
+      - ./rabbimq.yaml:/config/rabbimq.yaml:ro
+    command: ["rabbimq", "consume", "-addr", "http://broker:8080", "-channel", "orders", "-config", "/config/rabbimq.yaml"]

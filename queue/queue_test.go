@@ -6,13 +6,16 @@ import (
 	"testing"
 )
 
-func TestInMemoryQueue(t *testing.T) {
+func TestQueue(t *testing.T) {
 	q := NewInMemoryQueue()
 
 	// Test case 1: Enqueue and Dequeue a single item
 	t.Run("Single Item", func(t *testing.T) {
 		task := []byte("task1")
-		q.Enqueue(task)
+		err := q.Enqueue(task)
+		if err != nil {
+			t.Fatalf("Expected no error when enqueuing, but got %v", err)
+		}
 
 		if q.Size() != 1 {
 			t.Errorf("Expected queue size to be 1, but got %d", q.Size())
@@ -34,6 +37,10 @@ func TestInMemoryQueue(t *testing.T) {
 
 	// Test case 2: Dequeue from an empty queue
 	t.Run("Dequeue from empty", func(t *testing.T) {
+		// ensure queue is empty before this test
+		for q.Size() > 0 {
+			q.Dequeue()
+		}
 		_, ok := q.Dequeue()
 		if ok {
 			t.Errorf("Expected no task to be dequeued from an empty queue")
@@ -45,8 +52,14 @@ func TestInMemoryQueue(t *testing.T) {
 		task1 := []byte("task1")
 		task2 := []byte("task2")
 
-		q.Enqueue(task1)
-		q.Enqueue(task2)
+		err := q.Enqueue(task1)
+		if err != nil {
+			t.Fatalf("Expected no error when enqueuing, but got %v", err)
+		}
+		err = q.Enqueue(task2)
+		if err != nil {
+			t.Fatalf("Expected no error when enqueuing, but got %v", err)
+		}
 
 		dequeuedTask1, _ := q.Dequeue()
 		if !bytes.Equal(task1, dequeuedTask1) {
@@ -60,7 +73,7 @@ func TestInMemoryQueue(t *testing.T) {
 	})
 }
 
-func TestInMemoryQueueConcurrency(t *testing.T) {
+func TestQueueConcurrency(t *testing.T) {
 	q := NewInMemoryQueue()
 	numGoroutines := 100
 	numTasksPerGoroutine := 10
@@ -72,7 +85,10 @@ func TestInMemoryQueueConcurrency(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for j := 0; j < numTasksPerGoroutine; j++ {
-				q.Enqueue([]byte("task"))
+				err := q.Enqueue([]byte("task"))
+				if err != nil {
+					t.Errorf("Expected no error when enqueuing, but got %v", err)
+				}
 			}
 		}()
 	}
