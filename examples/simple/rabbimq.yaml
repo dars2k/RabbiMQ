@@ -1,0 +1,16 @@
+# Shared config for server and SDK clients
+passphrase: secret
+
+# Server limits
+limits:
+  maxQueueDepth: 1000
+  maxChannelDepth: 200
+  maxChannels: 20
+  maxConsumers: 50
+  maxMessageBytes: 1048576
+
+# Client settings
+address: http://127.0.0.1:8080
+timeout: 10s
+insecure_skip_verify: false
+ca_cert_file: ""
