@@ -10,4 +10,4 @@ cd examples/docker
 docker compose up --build
 ```
 
-The producer publishes a task to the `orders` channel and the consumer streams one task, then exits.
+The producer publishes a task to the `orders` channel and the consumer receives one task (`-once`), then exits. The broker reports healthy through `/healthz`.

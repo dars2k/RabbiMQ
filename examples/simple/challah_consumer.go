@@ -6,6 +6,9 @@ import (
 	"context"
 	"flag"
 	"log"
+	"os"
+	"os/signal"
+	"time"
 
 	"RabbiMQ/sdk"
 )
@@ -19,14 +22,26 @@ func main() {
 		log.Fatal(err)
 	}
 
-	for {
-		msg, ok, err := client.Consume(context.Background(), "orders")
-		if err != nil {
-			log.Printf("consume error: %v", err)
-			continue
-		}
-		if ok {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+
+	backoff := time.Second
+	for ctx.Err() == nil {
+		// Subscribe keeps one stream open, so no task is lost between reads.
+		msgs, errs := client.Subscribe(ctx, "orders")
+		for msg := range msgs {
+			backoff = time.Second
 			log.Printf("Customer received: %s", string(msg))
+		}
+		if err := <-errs; err != nil {
+			log.Printf("stream ended: %v (reconnecting in %s)", err, backoff)
+			select {
+			case <-time.After(backoff):
+			case <-ctx.Done():
+			}
+			if backoff < 30*time.Second {
+				backoff *= 2
+			}
 		}
 	}
 }

@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -39,12 +40,21 @@ func main() {
 		payload := []byte(fmt.Sprintf("Deliver challah to %s (order #%d)", address, orderID))
 
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		if err := client.Publish(ctx, "orders", payload); err != nil {
-			cancel()
+		err := client.Publish(ctx, "orders", payload)
+		cancel()
+		if sdk.IsShabbat(err) {
+			// The bakery rests too: wait until the broker accepts orders again.
+			var apiErr *sdk.APIError
+			if errors.As(err, &apiErr) && apiErr.RetryAfter > 0 {
+				log.Printf("Shabbat Shalom! Resuming orders in %s", apiErr.RetryAfter)
+				time.Sleep(apiErr.RetryAfter)
+			}
+			continue
+		}
+		if err != nil {
 			log.Printf("publish failed: %v", err)
 			continue
 		}
-		cancel()
 
 		log.Println("Order sent:", string(payload))
 	}

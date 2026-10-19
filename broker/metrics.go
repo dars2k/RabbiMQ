@@ -17,6 +17,8 @@ type MetricsSnapshot struct {
 	QueueDepth        int    `json:"queue_depth"`
 	HeldDuringShabbat int    `json:"held_during_shabbat"`
 	IsShabbat         bool   `json:"is_shabbat"`
+	Consumers         int    `json:"consumers"`
+	Channels          int    `json:"channels"`
 }
 
 // ChannelStats reports pending tasks per channel.
@@ -37,7 +39,7 @@ func (m *Metrics) incRejected() {
 	atomic.AddUint64(&m.rejected, 1)
 }
 
-func (m *Metrics) snapshot(queueDepth int, isShabbat bool) MetricsSnapshot {
+func (m *Metrics) snapshot(queueDepth int, isShabbat bool, consumers, channels int) MetricsSnapshot {
 	held := 0
 	if isShabbat {
 		held = queueDepth
@@ -50,5 +52,7 @@ func (m *Metrics) snapshot(queueDepth int, isShabbat bool) MetricsSnapshot {
 		QueueDepth:        queueDepth,
 		HeldDuringShabbat: held,
 		IsShabbat:         isShabbat,
+		Consumers:         consumers,
+		Channels:          channels,
 	}
 }

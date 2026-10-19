@@ -4,8 +4,11 @@ import (
 	"RabbiMQ/broker"
 	"RabbiMQ/queue"
 	"RabbiMQ/shabbat"
+	"fmt"
 	"path/filepath"
+	"sort"
 	"strings"
+	"time"
 )
 
 // RabbiMQ is the interface for the RabbiMQ message broker.
@@ -18,6 +21,8 @@ type RabbiMQ interface {
 	Metrics() broker.MetricsSnapshot
 	// Channels returns per-channel queue depths.
 	Channels() []broker.ChannelStats
+	// ShabbatStatus reports whether it is Shabbat and how long until that state next changes.
+	ShabbatStatus() (bool, time.Duration)
 	// AcquireConsumer reserves a consumer slot if available.
 	AcquireConsumer() error
 	// ReleaseConsumer releases a previously acquired consumer slot.
@@ -56,50 +61,93 @@ func NewWithFile(filePath string) (RabbiMQ, error) {
 }
 
 // NewWithFileConfig creates a new RabbiMQ instance with a persistent queue and config.
+// The default channel is stored at filePath and every other channel in a
+// sibling file (for "rabbimq.log" and channel "orders": "rabbimq.orders.log").
+// Channels persisted by a previous run are reopened so their pending tasks
+// are delivered and reported.
 func NewWithFileConfig(filePath string, cfg Config) (RabbiMQ, error) {
-	shabbatClock := shabbat.NewShabbatClock(&shabbat.RealClock{})
+	return newWithFileClock(&shabbat.RealClock{}, filePath, cfg)
+}
+
+func newWithFileClock(clock shabbat.Clock, filePath string, cfg Config) (RabbiMQ, error) {
+	shabbatClock := shabbat.NewShabbatClock(clock)
 	q, err := queue.NewPersistentQueue(filePath)
 	if err != nil {
 		return nil, err
 	}
 	b := broker.NewBrokerWithFactoryConfig(shabbatClock, q, func(channel string) (queue.Queue, error) {
-		path := channelLogPath(filePath, channel)
-		return queue.NewPersistentQueue(path)
+		return queue.NewPersistentQueue(channelLogPath(filePath, channel))
 	}, cfg.Limits)
+
+	channels, err := persistedChannels(filePath)
+	if err != nil {
+		b.Shutdown()
+		return nil, err
+	}
+	for _, channel := range channels {
+		if err := b.EnsureChannel(channel); err != nil {
+			b.Shutdown()
+			return nil, fmt.Errorf("restore channel %q: %w", channel, err)
+		}
+	}
 	return &rabbimq{broker: b}, nil
 }
 
-func channelLogPath(basePath, channel string) string {
-	dir := filepath.Dir(basePath)
+// splitLogPath splits a log path into its directory, file stem and extension.
+func splitLogPath(basePath string) (dir, name, ext string) {
+	dir = filepath.Dir(basePath)
 	base := filepath.Base(basePath)
-	ext := filepath.Ext(base)
-	name := strings.TrimSuffix(base, ext)
+	ext = filepath.Ext(base)
+	name = strings.TrimSuffix(base, ext)
 	if ext == "" {
 		ext = ".log"
 	}
 	if name == "" {
 		name = "rabbimq"
 	}
-	return filepath.Join(dir, name+"."+sanitizeChannel(channel)+ext)
+	return dir, name, ext
 }
 
-func sanitizeChannel(channel string) string {
-	if channel == "" {
-		return "default"
+// channelLogPath returns the log file for a channel. Channel names are
+// validated by the broker, so they are safe to use in file names.
+func channelLogPath(basePath, channel string) string {
+	dir, name, ext := splitLogPath(basePath)
+	return filepath.Join(dir, name+"."+channel+ext)
+}
+
+// persistedChannels lists the channels that have a log file next to basePath.
+func persistedChannels(basePath string) ([]string, error) {
+	dir, name, ext := splitLogPath(basePath)
+	prefix := name + "."
+	matches, err := filepath.Glob(filepath.Join(dir, globEscape(prefix)+"*"+globEscape(ext)))
+	if err != nil {
+		return nil, err
 	}
-	var b strings.Builder
-	for _, r := range channel {
-		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' || r == '_' {
-			b.WriteRune(r)
+
+	var channels []string
+	for _, match := range matches {
+		channel := strings.TrimSuffix(strings.TrimPrefix(filepath.Base(match), prefix), ext)
+		if channel == "" || channel == broker.DefaultChannel || broker.ValidateChannel(channel) != nil {
+			continue
 		}
+		channels = append(channels, channel)
 	}
-	if b.Len() == 0 {
-		return "default"
+	sort.Strings(channels)
+	return channels, nil
+}
+
+func globEscape(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		switch r {
+		case '*', '?', '[', ']', '\\':
+			b.WriteRune('\\')
+		}
+		b.WriteRune(r)
 	}
 	return b.String()
 }
 
-// Publish adds a task to the broker.
 // Publish adds a task to a specific channel.
 func (r *rabbimq) Publish(channel string, task []byte) error {
 	return r.broker.Publish(channel, task)
@@ -118,6 +166,11 @@ func (r *rabbimq) Metrics() broker.MetricsSnapshot {
 // Channels returns per-channel queue depths.
 func (r *rabbimq) Channels() []broker.ChannelStats {
 	return r.broker.Channels()
+}
+
+// ShabbatStatus reports whether it is Shabbat and how long until that state next changes.
+func (r *rabbimq) ShabbatStatus() (bool, time.Duration) {
+	return r.broker.ShabbatStatus()
 }
 
 // AcquireConsumer reserves a consumer slot if available.

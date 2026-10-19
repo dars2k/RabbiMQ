@@ -4,6 +4,7 @@ import (
 	"RabbiMQ/queue"
 	"RabbiMQ/shabbat"
 	"errors"
+	"sort"
 	"sync"
 	"time"
 )
@@ -14,25 +15,47 @@ var (
 	// ErrQueueFull is returned when the total queue limit is reached.
 	ErrQueueFull = errors.New("queue limit reached")
 	// ErrChannelFull is returned when a channel queue limit is reached.
-	ErrChannelFull = errors.New("channel limit reached")
+	ErrChannelFull = errors.New("channel queue limit reached")
 	// ErrChannelLimit is returned when the channel count limit is reached.
-	ErrChannelLimit = errors.New("channel limit reached")
+	ErrChannelLimit = errors.New("too many channels")
 	// ErrConsumerLimit is returned when the consumer limit is reached.
 	ErrConsumerLimit = errors.New("consumer limit reached")
 	// ErrMessageTooLarge is returned when a message exceeds the size limit.
 	ErrMessageTooLarge = errors.New("message exceeds size limit")
+	// ErrInvalidChannel is returned when a channel name contains unsupported characters.
+	ErrInvalidChannel = errors.New("invalid channel name: use up to 64 letters, digits, '-' or '_'")
+	// ErrClosed is returned when the broker has been shut down.
+	ErrClosed = errors.New("broker is shut down")
 )
 
+// MaxChannelNameLength is the longest accepted channel name.
+const MaxChannelNameLength = 64
+
+// DefaultChannel is the channel used when no channel name is given.
+const DefaultChannel = "default"
+
+// shabbatCheckInterval is how often the broker re-evaluates the Shabbat clock.
+const shabbatCheckInterval = time.Second
+
 // Broker is a message broker that observes Shabbat.
+//
+// Each channel has a FIFO queue and a delivery goroutine. A task is only
+// removed from its queue once a consumer has received it, so tasks are never
+// dropped by the broker while waiting for a consumer, for Shabbat to end, or
+// during shutdown.
 type Broker struct {
 	shabbatClock *shabbat.ShabbatClock
 	mu           sync.Mutex
 	isShabbat    bool
+	// stateChanged is closed (and replaced) whenever the Shabbat state flips,
+	// waking every delivery goroutine.
+	stateChanged chan struct{}
+	closed       bool
+	closeOnce    sync.Once
 	wg           sync.WaitGroup
 	shutdown     chan struct{}
 	metrics      *Metrics
 	channels     map[string]*channelState
-	defaultQueue queue.Queue
 	queueFactory QueueFactory
 	config       Config
 	totalDepth   int
@@ -47,9 +70,9 @@ type channelState struct {
 	taskCh  chan []byte
 	notify  chan struct{}
 	channel string
+	// depth counts pending tasks, including ones being enqueued. Guarded by Broker.mu.
+	depth int
 }
-
-const defaultChannel = "default"
 
 // NewBroker creates a new Broker with a default queue.
 func NewBroker(shabbatClock *shabbat.ShabbatClock, queue queue.Queue) *Broker {
@@ -63,28 +86,21 @@ func NewBrokerWithFactory(shabbatClock *shabbat.ShabbatClock, queue queue.Queue,
 
 // NewBrokerWithFactoryConfig creates a new Broker with a queue factory and config.
 func NewBrokerWithFactoryConfig(shabbatClock *shabbat.ShabbatClock, queue queue.Queue, factory QueueFactory, config Config) *Broker {
-	config = config.normalize()
+	config = config.Normalize()
 	b := &Broker{
 		shabbatClock: shabbatClock,
 		isShabbat:    shabbatClock.IsShabbat(),
+		stateChanged: make(chan struct{}),
 		shutdown:     make(chan struct{}),
 		metrics:      &Metrics{},
 		channels:     make(map[string]*channelState),
-		defaultQueue: queue,
 		queueFactory: factory,
 		config:       config,
 	}
 
-	defaultState := &channelState{
-		queue:   queue,
-		taskCh:  make(chan []byte),
-		notify:  make(chan struct{}, 1),
-		channel: defaultChannel,
-	}
-	b.channels[defaultChannel] = defaultState
-	b.totalDepth = queue.Size()
-	b.wg.Add(1)
-	go b.deliveryManager(defaultState)
+	b.mu.Lock()
+	b.addChannelLocked(DefaultChannel, queue)
+	b.mu.Unlock()
 
 	b.wg.Add(1)
 	go b.shabbatWatcher()
@@ -92,44 +108,83 @@ func NewBrokerWithFactoryConfig(shabbatClock *shabbat.ShabbatClock, queue queue.
 	return b
 }
 
+// ValidateChannel reports whether name is an acceptable channel name.
+// The empty string selects the default channel.
+func ValidateChannel(name string) error {
+	if len(name) > MaxChannelNameLength {
+		return ErrInvalidChannel
+	}
+	for _, r := range name {
+		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' || r == '_') {
+			return ErrInvalidChannel
+		}
+	}
+	return nil
+}
+
+func channelName(channel string) string {
+	if channel == "" {
+		return DefaultChannel
+	}
+	return channel
+}
+
 // Publish adds a task to the broker under a specific channel.
 // It returns ErrShabbatObserved if it is currently Shabbat.
 func (b *Broker) Publish(channel string, task []byte) error {
 	if len(task) > b.config.MaxMessageBytes {
+		b.metrics.incRejected()
 		return ErrMessageTooLarge
 	}
 
-	b.mu.Lock()
-	if b.isShabbat {
+	// Read the clock directly so publishing stops exactly when Shabbat
+	// starts rather than on the watcher's next tick.
+	if b.checkShabbat() {
 		b.metrics.incRejected()
-		b.mu.Unlock()
 		return ErrShabbatObserved
 	}
-	b.mu.Unlock()
 
 	state, err := b.getOrCreateChannel(channel)
 	if err != nil {
+		if !errors.Is(err, ErrClosed) {
+			b.metrics.incRejected()
+		}
 		return err
 	}
 
+	// Reserve capacity before enqueueing so concurrent publishers cannot
+	// exceed the configured limits.
 	b.mu.Lock()
+	if b.closed {
+		b.mu.Unlock()
+		return ErrClosed
+	}
 	if b.config.MaxQueueDepth > 0 && b.totalDepth >= b.config.MaxQueueDepth {
 		b.mu.Unlock()
+		b.metrics.incRejected()
 		return ErrQueueFull
 	}
-	if b.config.MaxChannelDepth > 0 && state.queue.Size() >= b.config.MaxChannelDepth {
+	if b.config.MaxChannelDepth > 0 && state.depth >= b.config.MaxChannelDepth {
 		b.mu.Unlock()
+		b.metrics.incRejected()
 		return ErrChannelFull
 	}
+	b.totalDepth++
+	state.depth++
 	b.mu.Unlock()
 
 	if err := state.queue.Enqueue(task); err != nil {
+		b.mu.Lock()
+		b.totalDepth--
+		state.depth--
+		b.mu.Unlock()
+		if errors.Is(err, queue.ErrQueueClosed) {
+			return ErrClosed
+		}
 		return err
 	}
 	b.metrics.incPublished()
-	b.mu.Lock()
-	b.totalDepth++
-	b.mu.Unlock()
+
 	// Non-blocking notify to wake the delivery manager.
 	select {
 	case state.notify <- struct{}{}:
@@ -139,6 +194,8 @@ func (b *Broker) Publish(channel string, task []byte) error {
 }
 
 // Consume returns a channel that receives tasks for a specific channel.
+// Multiple consumers of the same channel compete for tasks. The returned
+// channel is closed when the broker shuts down.
 func (b *Broker) Consume(channel string) (<-chan []byte, error) {
 	state, err := b.getOrCreateChannel(channel)
 	if err != nil {
@@ -149,156 +206,164 @@ func (b *Broker) Consume(channel string) (<-chan []byte, error) {
 	return state.taskCh, nil
 }
 
+// EnsureChannel opens a channel (and its queue) without publishing to it.
+// It is used to restore channels that have tasks persisted from a previous run.
+func (b *Broker) EnsureChannel(channel string) error {
+	_, err := b.getOrCreateChannel(channel)
+	return err
+}
+
+// IsShabbat reports whether the broker currently observes Shabbat.
+func (b *Broker) IsShabbat() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.isShabbat
+}
+
+// ShabbatStatus reports whether it is Shabbat and how long until that state next changes.
+func (b *Broker) ShabbatStatus() (bool, time.Duration) {
+	return b.shabbatClock.Status()
+}
+
+// checkShabbat refreshes the Shabbat state from the clock and wakes the
+// delivery goroutines if it changed. It returns the current state.
+func (b *Broker) checkShabbat() bool {
+	isShabbat := b.shabbatClock.IsShabbat()
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if isShabbat != b.isShabbat {
+		b.isShabbat = isShabbat
+		close(b.stateChanged)
+		b.stateChanged = make(chan struct{})
+	}
+	return isShabbat
+}
+
 // shabbatWatcher monitors for changes in Shabbat state.
 func (b *Broker) shabbatWatcher() {
 	defer b.wg.Done()
-	ticker := time.NewTicker(1 * time.Second)
+	ticker := time.NewTicker(shabbatCheckInterval)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ticker.C:
-			b.mu.Lock()
-			wasShabbat := b.isShabbat
-			b.isShabbat = b.shabbatClock.IsShabbat()
-			isShabbat := b.isShabbat
-			b.mu.Unlock()
-
-			if wasShabbat && !isShabbat {
-				// Shabbat has ended, resume delivery
-				b.resumeDelivery()
-			}
+			b.checkShabbat()
 		case <-b.shutdown:
 			return
 		}
 	}
 }
 
-// deliveryManager is responsible for delivering tasks to consumers per channel.
+// deliveryManager hands tasks from a channel's queue to its consumers in
+// FIFO order. It is the only goroutine that removes tasks from that queue,
+// so the task returned by Peek is the one later removed by Dequeue.
 func (b *Broker) deliveryManager(state *channelState) {
 	defer b.wg.Done()
 	for {
-		select {
-		case <-b.shutdown:
-			return
-		default:
-		}
-
 		b.mu.Lock()
 		isShabbat := b.isShabbat
+		stateChanged := b.stateChanged
 		b.mu.Unlock()
 
 		if isShabbat {
-			time.Sleep(1 * time.Second)
+			select {
+			case <-stateChanged:
+			case <-b.shutdown:
+				return
+			}
 			continue
 		}
 
-		task, ok := state.queue.Dequeue()
-		if ok {
-			b.metrics.incDelivered()
-			b.mu.Lock()
-			if b.totalDepth > 0 {
-				b.totalDepth--
+		task, ok := state.queue.Peek()
+		if !ok {
+			select {
+			case <-state.notify:
+			case <-stateChanged:
+			case <-b.shutdown:
+				return
 			}
-			b.mu.Unlock()
-			state.taskCh <- task
 			continue
 		}
 
 		select {
-		case <-state.notify:
+		case state.taskCh <- task:
+			state.queue.Dequeue()
+			b.mu.Lock()
+			b.totalDepth--
+			state.depth--
+			b.mu.Unlock()
+			b.metrics.incDelivered()
+		case <-stateChanged:
+			// Shabbat may have started; re-check before delivering.
 		case <-b.shutdown:
 			return
 		}
 	}
 }
 
-// resumeDelivery sends all pending tasks from the queues to their task channels.
-func (b *Broker) resumeDelivery() {
-	b.mu.Lock()
-	states := make([]*channelState, 0, len(b.channels))
-	for _, state := range b.channels {
-		states = append(states, state)
-	}
-	b.mu.Unlock()
-
-	for _, state := range states {
-		for {
-			task, ok := state.queue.Dequeue()
-			if !ok {
-				break
-			}
-			b.metrics.incDelivered()
-			b.mu.Lock()
-			if b.totalDepth > 0 {
-				b.totalDepth--
-			}
-			b.mu.Unlock()
-			state.taskCh <- task
-		}
-	}
-}
-
-// Shutdown gracefully shuts down the broker.
+// Shutdown gracefully shuts down the broker. Pending tasks remain in their
+// queues. It is safe to call more than once.
 func (b *Broker) Shutdown() {
-	close(b.shutdown)
-	b.wg.Wait()
-	b.mu.Lock()
-	states := make([]*channelState, 0, len(b.channels))
-	for _, state := range b.channels {
-		states = append(states, state)
-	}
-	b.mu.Unlock()
+	b.closeOnce.Do(func() {
+		b.mu.Lock()
+		b.closed = true
+		states := b.statesLocked()
+		b.mu.Unlock()
 
-	for _, state := range states {
-		close(state.taskCh)
-		state.queue.Close()
-	}
+		close(b.shutdown)
+		b.wg.Wait()
+
+		for _, state := range states {
+			close(state.taskCh)
+			state.queue.Close()
+		}
+	})
 }
 
 // Metrics returns a snapshot of broker metrics.
 func (b *Broker) Metrics() MetricsSnapshot {
 	b.mu.Lock()
-	isShabbat := b.isShabbat
-	states := make([]*channelState, 0, len(b.channels))
-	for _, state := range b.channels {
-		states = append(states, state)
-	}
-	b.mu.Unlock()
-
-	queueDepth := 0
-	for _, state := range states {
-		queueDepth += state.queue.Size()
-	}
-	return b.metrics.snapshot(queueDepth, isShabbat)
+	defer b.mu.Unlock()
+	return b.metrics.snapshot(b.totalDepth, b.isShabbat, b.consumers, len(b.channels))
 }
 
-// Channels returns per-channel queue depth information.
+// Channels returns per-channel queue depth information, sorted by name.
 func (b *Broker) Channels() []ChannelStats {
 	b.mu.Lock()
-	states := make([]*channelState, 0, len(b.channels))
-	for _, state := range b.channels {
-		states = append(states, state)
-	}
-	b.mu.Unlock()
+	defer b.mu.Unlock()
 
-	stats := make([]ChannelStats, 0, len(states))
-	for _, state := range states {
+	stats := make([]ChannelStats, 0, len(b.channels))
+	for _, state := range b.channels {
 		stats = append(stats, ChannelStats{
 			Channel:    state.channel,
-			QueueDepth: state.queue.Size(),
+			QueueDepth: state.depth,
 		})
 	}
+	sort.Slice(stats, func(i, j int) bool { return stats[i].Channel < stats[j].Channel })
 	return stats
 }
 
-func (b *Broker) getOrCreateChannel(channel string) (*channelState, error) {
-	name := channel
-	if name == "" {
-		name = defaultChannel
+func (b *Broker) statesLocked() []*channelState {
+	states := make([]*channelState, 0, len(b.channels))
+	for _, state := range b.channels {
+		states = append(states, state)
 	}
+	return states
+}
+
+func (b *Broker) getOrCreateChannel(channel string) (*channelState, error) {
+	if err := ValidateChannel(channel); err != nil {
+		return nil, err
+	}
+	name := channelName(channel)
 
 	b.mu.Lock()
+	if b.closed {
+		b.mu.Unlock()
+		return nil, ErrClosed
+	}
 	if state, ok := b.channels[name]; ok {
 		b.mu.Unlock()
 		return state, nil
@@ -309,11 +374,10 @@ func (b *Broker) getOrCreateChannel(channel string) (*channelState, error) {
 	}
 	b.mu.Unlock()
 
+	// Create the queue outside the lock: it may touch the filesystem.
 	var q queue.Queue
-	var err error
-	if name == defaultChannel {
-		q = b.defaultQueue
-	} else if b.queueFactory != nil {
+	if b.queueFactory != nil {
+		var err error
 		q, err = b.queueFactory(name)
 		if err != nil {
 			return nil, err
@@ -322,31 +386,48 @@ func (b *Broker) getOrCreateChannel(channel string) (*channelState, error) {
 		q = queue.NewInMemoryQueue()
 	}
 
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if existing, ok := b.channels[name]; ok {
+		// Another goroutine created the channel first.
+		q.Close()
+		return existing, nil
+	}
+	if b.closed {
+		q.Close()
+		return nil, ErrClosed
+	}
+	if b.config.MaxChannels > 0 && len(b.channels) >= b.config.MaxChannels {
+		q.Close()
+		return nil, ErrChannelLimit
+	}
+	return b.addChannelLocked(name, q), nil
+}
+
+// addChannelLocked registers a channel and starts its delivery goroutine.
+// b.mu must be held.
+func (b *Broker) addChannelLocked(name string, q queue.Queue) *channelState {
 	state := &channelState{
 		queue:   q,
 		taskCh:  make(chan []byte),
 		notify:  make(chan struct{}, 1),
 		channel: name,
-	}
-
-	b.mu.Lock()
-	if existing, ok := b.channels[name]; ok {
-		b.mu.Unlock()
-		return existing, nil
+		depth:   q.Size(),
 	}
 	b.channels[name] = state
-	b.totalDepth += state.queue.Size()
+	b.totalDepth += state.depth
 	b.wg.Add(1)
 	go b.deliveryManager(state)
-	b.mu.Unlock()
-
-	return state, nil
+	return state
 }
 
 // AcquireConsumer reserves a consumer slot if available.
 func (b *Broker) AcquireConsumer() error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if b.closed {
+		return ErrClosed
+	}
 	if b.config.MaxConsumers > 0 && b.consumers >= b.config.MaxConsumers {
 		return ErrConsumerLimit
 	}

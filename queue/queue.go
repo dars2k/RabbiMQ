@@ -7,6 +7,8 @@ import (
 // Queue is an interface for a thread-safe, FIFO queue.
 type Queue interface {
 	Enqueue(task []byte) error
+	// Peek returns the task at the front of the queue without removing it.
+	Peek() ([]byte, bool)
 	Dequeue() ([]byte, bool)
 	Size() int
 	Close() error
@@ -16,6 +18,7 @@ type Queue interface {
 type inMemoryQueue struct {
 	mu    sync.Mutex
 	tasks [][]byte
+	head  int
 }
 
 // NewInMemoryQueue creates a new inMemoryQueue.
@@ -33,18 +36,42 @@ func (q *inMemoryQueue) Enqueue(task []byte) error {
 	return nil
 }
 
+// Peek returns the task at the front of the queue without removing it.
+func (q *inMemoryQueue) Peek() ([]byte, bool) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	if q.head >= len(q.tasks) {
+		return nil, false
+	}
+	return q.tasks[q.head], true
+}
+
 // Dequeue removes and returns the task from the front of the queue.
 // It returns the task and true if the queue is not empty, otherwise it returns nil and false.
 func (q *inMemoryQueue) Dequeue() ([]byte, bool) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
-	if len(q.tasks) == 0 {
+	if q.head >= len(q.tasks) {
 		return nil, false
 	}
 
-	task := q.tasks[0]
-	q.tasks = q.tasks[1:]
+	task := q.tasks[q.head]
+	// Drop the reference so the payload can be garbage collected.
+	q.tasks[q.head] = nil
+	q.head++
+
+	// Reclaim the backing array once the consumed prefix dominates it.
+	if q.head == len(q.tasks) {
+		q.tasks = q.tasks[:0]
+		q.head = 0
+	} else if q.head >= 64 && q.head*2 >= len(q.tasks) {
+		remaining := make([][]byte, len(q.tasks)-q.head)
+		copy(remaining, q.tasks[q.head:])
+		q.tasks = remaining
+		q.head = 0
+	}
 	return task, true
 }
 
@@ -52,7 +79,7 @@ func (q *inMemoryQueue) Dequeue() ([]byte, bool) {
 func (q *inMemoryQueue) Size() int {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	return len(q.tasks)
+	return len(q.tasks) - q.head
 }
 
 // Close is a no-op for the in-memory queue.
