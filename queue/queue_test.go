@@ -115,3 +115,59 @@ func TestQueueConcurrency(t *testing.T) {
 		t.Errorf("Expected queue size to be 0 after concurrent dequeues, but got %d", q.Size())
 	}
 }
+
+func TestQueuePeek(t *testing.T) {
+	q := NewInMemoryQueue()
+	if _, ok := q.Peek(); ok {
+		t.Fatal("expected empty peek")
+	}
+	_ = q.Enqueue([]byte("a"))
+	_ = q.Enqueue([]byte("b"))
+
+	got, ok := q.Peek()
+	if !ok || string(got) != "a" {
+		t.Fatalf("unexpected peek: %q %v", got, ok)
+	}
+	if q.Size() != 2 {
+		t.Fatalf("peek must not remove, size=%d", q.Size())
+	}
+	got, _ = q.Dequeue()
+	if string(got) != "a" {
+		t.Fatalf("unexpected dequeue: %q", got)
+	}
+	got, _ = q.Peek()
+	if string(got) != "b" {
+		t.Fatalf("unexpected peek after dequeue: %q", got)
+	}
+}
+
+func TestQueueReclaimsBackingArray(t *testing.T) {
+	q := NewInMemoryQueue().(*inMemoryQueue)
+	for i := 0; i < 1000; i++ {
+		_ = q.Enqueue([]byte{byte(i)})
+	}
+	for i := 0; i < 900; i++ {
+		got, ok := q.Dequeue()
+		if !ok || got[0] != byte(i) {
+			t.Fatalf("dequeue %d: got %v %v", i, got, ok)
+		}
+	}
+	if q.Size() != 100 {
+		t.Fatalf("unexpected size: %d", q.Size())
+	}
+	if len(q.tasks) > 500 {
+		t.Fatalf("backing array not compacted: len=%d head=%d", len(q.tasks), q.head)
+	}
+	for i := 900; i < 1000; i++ {
+		got, _ := q.Dequeue()
+		if got[0] != byte(i) {
+			t.Fatalf("order broken at %d: %v", i, got)
+		}
+	}
+	if q.Size() != 0 {
+		t.Fatalf("expected empty queue, size=%d", q.Size())
+	}
+	if err := q.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+}
