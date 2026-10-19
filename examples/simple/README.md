@@ -28,6 +28,8 @@ insecure_skip_verify: false
 ca_cert_file: ""
 ```
 
+Server-only keys (`limits`) are ignored by clients and client-only keys (`address`, `timeout`) are ignored by the server.
+
 Run with config:
 
 ```bash
@@ -44,6 +46,7 @@ package main
 import (
 	"context"
 	"log"
+	"time"
 
 	"RabbiMQ/sdk"
 )
@@ -95,14 +98,13 @@ func main() {
 	}
 
 	for {
-		msg, ok, err := client.Consume(context.Background(), "orders")
-		if err != nil {
-			log.Printf("consume error: %v", err)
-			continue
-		}
-		if ok {
+		// One long-lived stream: no task is lost between reads.
+		msgs, errs := client.Subscribe(context.Background(), "orders")
+		for msg := range msgs {
 			log.Printf("received: %s", string(msg))
 		}
+		log.Printf("stream ended: %v", <-errs)
+		time.Sleep(time.Second) // back off before reconnecting
 	}
 }
 ```

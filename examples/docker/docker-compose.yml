@@ -7,9 +7,9 @@ services:
       - "8080:8080"
     volumes:
       - ./rabbimq.yaml:/config/rabbimq.yaml:ro
-    command: ["rabbimq", "-addr", "0.0.0.0:8080", "-config", "/config/rabbimq.yaml"]
+    command: ["rabbimq", "-addr", "0.0.0.0:8080", "-config", "/config/rabbimq.yaml", "-once"]
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:8080/channels"]
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -34,4 +34,4 @@ services:
         condition: service_healthy
     volumes:
       - ./rabbimq.yaml:/config/rabbimq.yaml:ro
-    command: ["rabbimq", "consume", "-addr", "http://broker:8080", "-channel", "orders", "-config", "/config/rabbimq.yaml"]
+    command: ["rabbimq", "consume", "-addr", "http://broker:8080", "-channel", "orders", "-config", "/config/rabbimq.yaml", "-once"]
