@@ -13,6 +13,11 @@ import (
 
 // ServerConfig defines broker/server settings.
 type ServerConfig struct {
+	// Addr is the listen address. Command-line flags take precedence.
+	Addr string `json:"addr" yaml:"addr"`
+	// DataFile is the log file for the default channel; other channels are
+	// stored next to it. Command-line flags take precedence.
+	DataFile   string        `json:"dataFile" yaml:"dataFile"`
 	Passphrase string        `json:"passphrase" yaml:"passphrase"`
 	Limits     broker.Config `json:"limits" yaml:"limits"`
 }
@@ -27,6 +32,9 @@ func LoadServerConfig(path string) (ServerConfig, error) {
 	var cfg ServerConfig
 	if err := unmarshalConfig(path, data, &cfg); err != nil {
 		return ServerConfig{}, err
+	}
+	if err := cfg.Limits.Validate(); err != nil {
+		return ServerConfig{}, fmt.Errorf("%s: limits: %w", path, err)
 	}
 	return cfg, nil
 }
